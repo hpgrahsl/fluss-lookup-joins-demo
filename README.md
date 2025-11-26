@@ -63,7 +63,7 @@ Once this is set up, switch to a terminal window, make sure you are in the root 
 docker compose up
 ```
 
-Give it a few moments. Eventually, you should have a total of N containers up and running:
+Give it a few moments. Eventually, you should have a total of seven containers up and running:
 
 ```bash
 CONTAINER ID   IMAGE                                                 COMMAND                  CREATED              STATUS              PORTS                                         NAMES
@@ -76,11 +76,94 @@ CONTAINER ID   IMAGE                                                 COMMAND    
 76ebf85b0694   zookeeper:3.9.2                                       "/docker-entrypoint.…"   About a minute ago   Up About a minute   2181/tcp, 2888/tcp, 3888/tcp, 8080/tcp        flink-fluss-demo-02-zookeeper-1
 ```
 
-One of them, _shadowtraffic_, synthetically generates all event payloads in the background - in total `250000` records spanning across the three Kafka topics (`ecom_customers`, `ecom_products`, `ecom_orders`) involved. The configuration details can be found in [data_generator.json](./st/data_generator.json)
+One of them runs _shadowtraffic_ to synthetically generate all event payloads in the background - in total `250000` records spanning across the three Kafka topics (`ecom_customers`, `ecom_products`, `ecom_orders`) involved. The configuration details can be found in [data_generator.json](./st/data_generator.json)
 
-### Scenario 1: Fluss Ingest and Lookup `JOIN`s in Flink
+## Scenario 1: Kafka Ingest and Regular `JOIN`s in Flink
 
-#### Flink SQL Job Description
+### Flink SQL Job Description
+
+The Flink SQL job serving as object of study for regular `JOIN`s is defined as follows:
+
+```sql
+INSERT INTO order_lines_enriched
+SELECT 
+    o.id AS order_id,
+    c.id AS customer_id,
+    c.name AS customer_name,
+    c.membership_level,
+    c.shipping_address,
+    o.notes,
+    o.create_ts AS order_datetime,
+    o.creditcard AS creditcard,
+    o.discount_percent,
+    ol.product_id,
+    ol.items AS quantity,
+    p.name AS product_name,
+    p.brand,
+    p.vendor,
+    p.price AS unit_price,
+    ROUND((p.price * ol.items),2) AS line_subtotal,
+    ROUND((p.price * ol.items * (100 - o.discount_percent) / 100),2) AS line_total_discounted    
+FROM orders AS o
+CROSS JOIN UNNEST (order_lines) AS ol(product_id, items)
+LEFT JOIN customers AS c
+    ON o.customer_id = c.id
+LEFT JOIN products AS p
+    ON ol.product_id = p.id;
+```
+
+It reads the stream of incoming `orders`, flattens the order's line items by means of `CROSS JOIN UNNEST`, does a first regular `LEFT JOIN` with `customers`, and a second regular `LEFT JOIN` against `products`. The outcome of this is a decomposed order for which all line items have been enriched by additional information.
+
+The resulting rows for one specific, original input `order` record could look like so:
+
+```bash
+                       order_id                    customer_id                  customer_name               membership_level               shipping_address                          notes            create_ts                     creditcard discount_percent                     product_id    quantity                   product_name                          brand                         vendor                     unit_price                  line_subtotal          line_total_discounted
+ 6ed6ae05-8395-c005-7fd3-541b6~ 9b8a5188-d320-cd53-197f-030d2~                  Elvis Kilback                           free Suite 153 1004 David Lodge, O~ Fuga labore beatae iste saepe~        1764104664426            6762-8206-4774-4347                6 c8df0188-11bb-91dc-024a-261ca~           8     Incredible Rubber Computer                           Dell                         Target                           8.05                           64.4                          60.54
+ 6ed6ae05-8395-c005-7fd3-541b6~ 9b8a5188-d320-cd53-197f-030d2~                  Elvis Kilback                           free Suite 153 1004 David Lodge, O~ Fuga labore beatae iste saepe~        1764104664426            6762-8206-4774-4347                6 1e7cfa4e-3a04-0d2c-2af0-6ace2~          14           Gorgeous Steel Plate                           Nike                 Dollar General                          71.72                        1004.08                         943.84
+ 6ed6ae05-8395-c005-7fd3-541b6~ 9b8a5188-d320-cd53-197f-030d2~                  Elvis Kilback                           free Suite 153 1004 David Lodge, O~ Fuga labore beatae iste saepe~        1764104664426            6762-8206-4774-4347                6 990deeab-7453-0b3f-7b18-2d867~           3            Rustic Concrete Car                             LG                         Amazon                          35.71                         107.13                          100.7
+
+```
+
+### Flink SQL Job Execution
+
+There is a convenient script which allows you to execute all the necessary [DDL](./data/flink/sql/kafka_ingest_ddl.sql) + [DML](./data/flink/sql/kafka_ingest_dml.sql) statements required to launch this Flink SQL job. From the root folder of this repository run
+
+```bash
+docker compose exec jobmanager /opt/sql-client/sql/kafka-ingest-run.sh
+```
+
+### Flink SQL Job Inspection
+
+Let this job run for a couple of minutes, then proceed to the [Flink Web Dashboard](http://localhost:8081/#/job/running) which shows the running job. Click on it to dig a little deeper:
+
+1. The Flink job graph for the SQL query above looks like this:
+
+![image](./docs/screenshots/02a_regular_join_kafka_job_graph.png)
+
+2. If you switch to the *Checkpoints* tab and then choose *History*, you should be able to see a few completed checkpoints. The screenshot below was taken at about three minutes into running this job:
+
+![image](./docs/screenshots/02b_regular_join_kafka_checkpoints_3m.png)
+
+It shows that checkpoint size is increasing fast over time as new data arrives for processing. Even for this toy example we have already about `100 MB` in total. By drilling into the details we can see that due to the regular `JOIN` operations, these operators accrue state which can become significant over time.
+
+![image](./docs/screenshots/02b_regular_join_kafka_checkpoints_3m_details.png)
+
+3. Wait another few minutes to verify this keeps growing and growing indeed and makes a noticeable difference as you are going to see later in scenario 2.
+
+![image](./docs/screenshots/02c_regular_join_kafka_checkpoints_6m.png)
+![image](./docs/screenshots/02c_regular_join_kafka_checkpoints_6m_details.png)
+
+4. After about nine minutes into the job - the moment when all `250k` simulated events have been processed - we see that the checkpoint results have stabilized. If we do some quick math, we can conclude that **the majority i.e. about two thirds (`68%`) or `~183 MB` of the checkpoing size is induced by the two regular `JOIN` operations.**
+
+![image](./docs/screenshots/02d_regular_join_kafka_checkpoints_9m_details.png)
+
+**! The larger the key space gets over time for either of the JOIN tables involved, the more state will accrue. This is an unfavorable consequence of running regular `JOIN`s in Flink and should be avoided for effectively unbounded key spaces as much as possible !**
+
+## Scenario 2: Fluss Ingest and Lookup `JOIN`s in Flink
+
+Let's contrast what we just witnessed with a different version of this job that uses lookup `JOIN`s and is sourced directly from the Fluss-backed tables.
+
+### Flink SQL Job Description
 
 The Flink SQL job serving as object of study for **lookup `JOIN`s** is defined as follows:
 
@@ -122,7 +205,7 @@ The resulting rows for one specific, original input `order` record could look li
  6ed6ae05-8395-c005-7fd3-541b6~ 9b8a5188-d320-cd53-197f-030d2~                  Elvis Kilback                           free Suite 153 1004 David Lodge, O~ Fuga labore beatae iste saepe~        1764107567809            6762-8206-4774-4347                6 1e7cfa4e-3a04-0d2c-2af0-6ace2~          14           Gorgeous Steel Plate                           Nike                 Dollar General                          71.72                        1004.08                         943.84
 ```
 
-#### Flink SQL Job Execution
+### Flink SQL Job Execution
 
 There is a convenient script which allows you to execute all the necessary [DDL](./data/flink/sql/fluss_ingest_ddl.sql) + [DML](./data/flink/sql/fluss_ingest_dml.sql) statements required to launch this Flink SQL job. From the root folder of this repository run
 
@@ -130,9 +213,9 @@ There is a convenient script which allows you to execute all the necessary [DDL]
 docker compose exec jobmanager /opt/sql-client/sql/fluss-ingest-run.sh
 ```
 
-#### Flink SQL Job Inspection
+### Flink SQL Job Inspection
 
-Let this job run for a couple of minutes, then proceed to the [Flink Web Dashboard](http://localhost:8081/#/job/running) which shows the running jobs. Click on the job which performs the enrichment (named `insert-into_fluss_catalog.fluss.fluss_order_lines_enriched`) to dig a little deeper.
+Let this job run for a couple of minutes, then proceed to the [Flink Web Dashboard](http://localhost:8081/#/job/running) which shows the running jobs. Click on the job that performs the enrichment (named `insert-into_fluss_catalog.fluss.fluss_order_lines_enriched`) to dig a little deeper.
 
 1. The Flink job graph for the SQL query discussed above looks like this:
 
@@ -142,7 +225,7 @@ Let this job run for a couple of minutes, then proceed to the [Flink Web Dashboa
 
 ![image](./docs/screenshots/03b_lookup_join_fluss_checkpoints_3m.png)
 
-By drilling into the latest checkpoint details, it becomes apparent that there is basically no checkpoint data induced by the two lookup `JOIN`s. The only actual and worth mentioning state in this case comes from the Sink Materializer itself.
+By drilling into the latest checkpoint details, it becomes apparent that there is basically no checkpoint data induced by the two lookup `JOIN`s. The only actual and worth mentioning state in this case comes from the Sink Materializer itself and at this point in time, it is unsuprisingly roughly the same (`~89 MB`) as for scenario 1.
 
 ![image](./docs/screenshots/03b_lookup_join_fluss_checkpoints_3m_details.png)
 
@@ -154,87 +237,3 @@ By drilling into the latest checkpoint details, it becomes apparent that there i
 
 ![image](./docs/screenshots/03d_lookup_join_fluss_checkpoints_9m_details.png)
 
-### Scenario 2: Kafka Ingest and Regular `JOIN`s in Flink
-
-Let's contrast what we just witnessed with a different version of this job that uses regular Flink `JOIN`s and is sourced directly from the Kafka-backed tables.
-
-#### Flink SQL Job Description
-
-The Flink SQL job serving as object of study for regular `JOIN`s is defined as follows:
-
-```sql
-INSERT INTO order_lines_enriched
-SELECT 
-    o.id AS order_id,
-    c.id AS customer_id,
-    c.name AS customer_name,
-    c.membership_level,
-    c.shipping_address,
-    o.notes,
-    o.create_ts AS order_datetime,
-    o.creditcard AS creditcard,
-    o.discount_percent,
-    ol.product_id,
-    ol.items AS quantity,
-    p.name AS product_name,
-    p.brand,
-    p.vendor,
-    p.price AS unit_price,
-    ROUND((p.price * ol.items),2) AS line_subtotal,
-    ROUND((p.price * ol.items * (100 - o.discount_percent) / 100),2) AS line_total_discounted    
-FROM orders AS o
-LEFT JOIN customers AS c
-    ON o.customer_id = c.id
-CROSS JOIN UNNEST (order_lines) AS ol(product_id, items)
-LEFT JOIN products AS p
-    ON ol.product_id = p.id;
-```
-
-It reads the stream of incoming `orders`, flattens the order's line items by means of `CROSS JOIN UNNEST`, does a first regular `LEFT JOIN` with `customers`, and does second regular `LEFT JOIN` against `products`. The outcome of this is a decomposed order for which all line items have been enriched by additional information.
-
-The resulting rows for one specific, original input `order` record could look like so:
-
-```bash
-                       order_id                    customer_id                  customer_name               membership_level               shipping_address                          notes            create_ts                     creditcard discount_percent                     product_id    quantity                   product_name                          brand                         vendor                     unit_price                  line_subtotal          line_total_discounted
- 6ed6ae05-8395-c005-7fd3-541b6~ 9b8a5188-d320-cd53-197f-030d2~                  Elvis Kilback                           free Suite 153 1004 David Lodge, O~ Fuga labore beatae iste saepe~        1764104664426            6762-8206-4774-4347                6 c8df0188-11bb-91dc-024a-261ca~           8     Incredible Rubber Computer                           Dell                         Target                           8.05                           64.4                          60.54
- 6ed6ae05-8395-c005-7fd3-541b6~ 9b8a5188-d320-cd53-197f-030d2~                  Elvis Kilback                           free Suite 153 1004 David Lodge, O~ Fuga labore beatae iste saepe~        1764104664426            6762-8206-4774-4347                6 1e7cfa4e-3a04-0d2c-2af0-6ace2~          14           Gorgeous Steel Plate                           Nike                 Dollar General                          71.72                        1004.08                         943.84
- 6ed6ae05-8395-c005-7fd3-541b6~ 9b8a5188-d320-cd53-197f-030d2~                  Elvis Kilback                           free Suite 153 1004 David Lodge, O~ Fuga labore beatae iste saepe~        1764104664426            6762-8206-4774-4347                6 990deeab-7453-0b3f-7b18-2d867~           3            Rustic Concrete Car                             LG                         Amazon                          35.71                         107.13                          100.7
-
-```
-
-#### Flink SQL Job Execution
-
-There is a convenient script which allows you to execute all the necessary [DDL](./data/flink/sql/kafka_ingest_ddl.sql) + [DML](./data/flink/sql/kafka_ingest_dml.sql) statements required to launch this Flink SQL job. From the root folder of this repository run
-
-```bash
-docker compose exec jobmanager /opt/sql-client/sql/kafka-ingest-run.sh
-```
-
-#### Flink SQL Job Inspection
-
-Let this job run for a couple of minutes, then proceed to the [Flink Web Dashboard](http://localhost:8081/#/job/running) which shows the running job. Click on it to dig a little deeper:
-
-1. The Flink job graph for the SQL query above looks like this:
-
-![image](./docs/screenshots/02a_regular_join_kafka_job_graph.png)
-
-2. If you switch to the *Checkpoints* tab and then choose *History*, you should be able to see a few completed checkpoints. The screenshot below was taken at about three minutes into running this job:
-
-![image](./docs/screenshots/02b_regular_join_kafka_checkpoints_3m.png)
-
-It shows that checkpoint size is increasing over time as new data arrives, faster than what we had seens earlier. For this toy example we have already about `100 MB` in total. 
-
-By drilling into the details we can see that due to the regular `JOIN` operations, these operators accrue state over time which can be significant.
-
-![image](./docs/screenshots/02b_regular_join_kafka_checkpoints_3m_details.png)
-
-3. Wait another few minutes to verify this keeps growing and growing indeed and makes a noticeable difference when compared with scenario 1.
-
-![image](./docs/screenshots/02c_regular_join_kafka_checkpoints_6m.png)
-![image](./docs/screenshots/02c_regular_join_kafka_checkpoints_6m_details.png)
-
-4. After about nine minutes into the job - the moment when all `250k` simulated events have been processed - we see that the checkpoint results have stabilized. If we do a quick math we can conclude that **the majority i.e. about two thirds (`68%`) or `~183 MB` of the checkpoing size is induced by the two regular `JOIN` operations.** Sink Materializer state at this point in time is unsuprisingly roughly the same (`~89 MB`) for this scenario 2.
-
-![image](./docs/screenshots/02d_regular_join_kafka_checkpoints_9m_details.png)
-
-**! The larger the key space gets over time for either of the JOIN tables involved, the more state will accrue. This is an unfavorable consequence of running regular `JOIN`s in Flink and should be avoided for effectively unbounded key spaces as much as possible !**
