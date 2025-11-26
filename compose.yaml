@@ -1,0 +1,101 @@
+name: flink-fluss-demo-02
+services:
+  kafka:
+    hostname: kafka
+    image: quay.io/strimzi/kafka:0.47.0-kafka-4.0.0
+    command: [
+      "sh", "-c",
+      "./bin/kafka-storage.sh format --standalone -t $${RANDOM_STORAGE_UUID} -c ./config/server.properties && bin/kafka-server-start.sh ./config/server.properties --override advertised.listeners=$${KAFKA_ADVERTISED_LISTENERS} --override num.partitions=$${KAFKA_NUM_PARTITIONS} --override group.min.session.timeout.ms=$${KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS}"
+    ]
+    ports:
+      - 9092:9092
+    environment:
+      LOG_DIR: "/tmp/logs"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS: 100
+      RANDOM_STORAGE_UUID: X6GgnrKiQJmebuL2rWU9dw
+    networks:
+      - my-network
+  jobmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.8.0-incubating
+    hostname: jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    volumes:
+      - ./data/flink/lib/flink-sql-connector-kafka-3.3.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.20.jar
+      - ./data/flink/sql:/opt/sql-client/sql
+    networks:
+      - my-network
+  taskmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.8.0-incubating
+    hostname: taskmanager
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 2048m
+        taskmanager.memory.framework.off-heap.size: 256m
+    volumes:
+      - ./data/flink/lib/flink-sql-connector-kafka-3.3.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.20.jar
+    networks:
+      - my-network
+  coordinator-server:
+    image: apache/fluss:0.8.0-incubating
+    command: coordinatorServer
+    depends_on:
+      - zookeeper
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://coordinator-server:9123
+        remote.data.dir: /tmp/fluss/remote-data
+    networks:
+      - my-network
+  tablet-server:
+    image: apache/fluss:0.8.0-incubating
+    command: tabletServer
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server:9123
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+        kv.snapshot.interval: 0s
+    networks:
+      - my-network
+  zookeeper:
+    restart: always
+    image: zookeeper:3.9.2
+    networks:
+      - my-network
+  
+  shadowtraffic:
+    image: shadowtraffic/shadowtraffic:1.11.11
+    hostname: shadowtraffic
+    depends_on:
+      - kafka
+    env_file:
+      - ./st/license.env
+    volumes:
+      - ./st/data_generator.json:/data/config.json
+    command: --config /data/config.json --seed 4321 --sample 250000
+    networks:
+      - my-network
+
+networks:
+  my-network:
+    name: flink-fluss-network-02

@@ -1,0 +1,226 @@
+{
+    "generators": [
+        {
+            "name": "_gen_customers",
+            "topic": "ecom_customers",
+            "vars": {
+                "CUSTOMER_ID": {
+                    "_gen": "uuid"
+                }
+            },
+            "key": {
+                "id": {
+                    "_gen": "var",
+                    "var": "CUSTOMER_ID"
+                }
+            },
+            "value": {
+                "id": {
+                    "_gen": "var",
+                    "var": "CUSTOMER_ID"
+                },
+                "name": {
+                    "_gen": "string",
+                    "expr": "#{Name.fullName}"
+                },
+                "direct_subscription": {
+                    "_gen": "boolean"
+                },
+                "membership_level": {
+                    "_gen": "oneOf",
+                    "choices": [
+                        "free",
+                        "pro",
+                        "elite"
+                    ]
+                },
+                "shipping_address": {
+                    "_gen": "string",
+                    "expr": "#{Address.fullAddress}"
+                },
+                "activation_date": {
+                    "_gen": "formatDateTime",
+                    "ms": {
+                        "_gen": "uniformDistribution",
+                        "bounds": [
+                            1577833200,
+                            {
+                                "_gen": "now"
+                            }
+                        ]
+                    }
+                }
+            },
+            "localConfigs": {
+                "maxEvents": {
+                    "_gen": "uniformDistribution",
+                    "bounds": [
+                        1,
+                        5
+                    ]
+                }
+            }
+        },
+        {
+            "name": "_gen_products",
+            "topic": "ecom_products",
+            "vars": {
+                "PRODUCT_ID": {
+                    "_gen": "uuid"
+                }
+            },
+            "key": {
+                "id": {
+                    "_gen": "var",
+                    "var": "PRODUCT_ID"
+                }
+            },
+            "value": {
+                "id": {
+                    "_gen": "var",
+                    "var": "PRODUCT_ID"
+                },
+                "name": {
+                    "_gen": "string",
+                    "expr": "#{Commerce.productName}"
+                },
+                "brand": {
+                    "_gen": "string",
+                    "expr": "#{Commerce.brand}"
+                },
+                "vendor": {
+                    "_gen": "string",
+                    "expr": "#{Commerce.vendor}"
+                },
+                "price": {
+                    "_gen": "string",
+                    "expr": "#{Commerce.price}",
+                    "cast": "double"
+                }
+            },
+            "localConfigs": {
+                "maxEvents": {
+                    "_gen": "uniformDistribution",
+                    "bounds": [
+                        2,
+                        8
+                    ]
+                }
+            }
+        },
+        {
+            "name": "_gen_orders",
+            "topic": "ecom_orders",
+            "vars": {
+                "ORDER_ID": {
+                    "_gen": "uuid"
+                }
+            },
+            "key": {
+                "id": {
+                    "_gen": "var",
+                    "var": "ORDER_ID"
+                }
+            },
+            "value": {
+                "id": {
+                    "_gen": "var",
+                    "var": "ORDER_ID"
+                },
+                "customer_id": {
+                    "_gen": "lookup",
+                    "topic": "ecom_customers",
+                    "path": [
+                        "value",
+                        "id"
+                    ]
+                },
+                "notes": {
+                    "_gen": "string",
+                    "expr": "#{Lorem.paragraph}"
+                },
+                "create_ts": {
+                    "_gen": "now"
+                },
+                "creditcard": {
+                    "_gen": "string",
+                    "expr": "#{Business.creditCardNumber}"
+                },
+                "discount_percent": {
+                    "_gen": "uniformDistribution",
+                    "bounds": [
+                        0,
+                        10
+                    ],
+                    "decimals": 0
+                },
+                "order_lines": {
+                    "_gen": "map",
+                    "key": {
+                        "_gen": "lookup",
+                            "topic": "ecom_products",
+                            "path": [
+                                "value",
+                                "id"
+                            ]
+                    },
+                    "value": {
+                        "_gen": "uniformDistribution",
+                            "bounds": [
+                                1,
+                                20
+                            ],
+                            "decimals": 0
+                    },
+                    "n": {
+                        "_gen": "uniformDistribution",
+                        "bounds": [
+                            1,
+                            10
+                        ],
+                        "decimals": 0
+                    }
+                }
+            },
+            "localConfigs": {
+                "throttleMs": 10,
+                "events": {
+                    "exactly": 1
+                }
+            }
+        }
+    ],
+    "schedule": {
+        "loop": true,
+        "stages": [
+            {
+                "generators": [
+                    "_gen_customers"
+                ]
+            },
+            {
+                "generators": [
+                    "_gen_products"
+                ]
+            },
+            {
+                "generators": [
+                    "_gen_orders"
+                ]
+            }
+        ]
+    },
+    "connections": {
+        "kafka": {
+            "kind": "kafka",
+            "topicPolicy": {
+                "policy": "dropAndCreate"
+            },
+            "producerConfigs": {
+                "bootstrap.servers": "kafka:9092",
+                "key.serializer": "io.shadowtraffic.kafka.serdes.JsonSerializer",
+                "value.serializer": "io.shadowtraffic.kafka.serdes.JsonSerializer"
+            }
+        }
+    }
+}
