@@ -237,3 +237,16 @@ By drilling into the latest checkpoint details, it becomes apparent that there i
 
 ![image](./docs/screenshots/03d_lookup_join_fluss_checkpoints_9m_details.png)
 
+## Addendum
+
+### Sink Materializer
+
+For both scenarios (regular JOIN and lookup JOIN), the jobs contained a sink materializer operator towards the end in their job graphs, right before the sink writers. This is due to the default setting `table.exec.sink.upsert-materialize = AUTO`, which causes Flink to add that operator for the jobs at hand.
+
+It's worth highlighting that for this enrichment use case, however, it's an option to configure the jobs with `table.exec.sink.upsert-materialize = NONE` in order to get rid of the sink materializer altogether.
+
+![image](./docs/screenshots/04a_lookup_join_fluss_no_sink_materializer.png)
+
+Doing so will remove its attached state completely and thereby reduce checkpoint data sizes accordingly in both scenarios. For instance, here is how this would look like for scenario 2 (lookup JOINs), which then becomes effectively fully stateless:
+
+![image](./docs/screenshots/04a_lookup_join_fluss_no_sink_materializer_final_checkpoint_details.png)
